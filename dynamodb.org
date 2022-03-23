@@ -1,0 +1,199 @@
+#+title:DynamoDB
+
+* What is DynamoDB
+
+A fully managed NoSQL database service from AWS that provides fast and consistent performance at any scale.
+
+* When to use DynamoDB
+
+** When to consider using DynamoDB
+
+You can determine your data access patterns up front
+
+- You don't need to write ad hoc queries.
+
+- This is usually the case for OLTP applications.
+
+** When to consider NOT using DynamoDB
+
+You can't determine your data access patterns up front
+
+- You need to write ad hoc queries.
+
+- This is usually the case for OLAP applications.
+
+
+* Key Concepts
+ 
+** Primary Keys
+
+The primary key is the ONLY required attribute for every item (row) in the table.
+
+The primary key must uniquely identify the item.
+
+*** Two types of primary keys:
+
+**** Simple: comprised of a partition key
+
+A simple primary key allows you to fetch a single item
+
+| (partition key) |             |
+|       tenant_id | tenant_name |
+|-----------------+-------------|
+|               1 | Smiles      |
+|               2 | Penguin     |
+
+**** *Composite*: comprised of a partition key + sort key
+   
+A composite primary key allows to fetch all the items with the same partition key
+
+| (partition key) | (sort key)  |             |               |
+|       tenant_id | campaign_id | tenant_name | campaign_name |
+|-----------------+-------------+-------------+---------------|
+|               1 | A           | Smiles      | Christmas     |
+|               1 | B           | Smiles      | Thanksgiving  |
+|               2 | A           | Penguin     | Memorial Day  |
+|               2 | B           | Penguin     | Flag Day      |
+|               2 | C           | Penguin     | My birthday   |
+
+You can also provide an optional sort key condition to narrow your results
+
+*** The primary key drives the access patterns to your table, so choose them carefully
+
+You generally want as many unique values as possible.
+
+To help with this (and to also support relational type access patterns), a recommended pattern is to overload the keys of an item, by storing some meta information about the type of the item
+
+| (partition key) | (sort key)                   |             |               |               |
+| pk              | sk                           | tenant_name | campaign_name | customer_name |
+|-----------------+------------------------------+-------------+---------------+---------------|
+| TENANT_ID#1     | #CAMPAIGN_ID#A               | Smiles      | Christmas     |               |
+| TENANT_ID#1     | #CAMPAIGN_ID#B               | Smiles      | Thanksgiving  |               |
+| TENANT_ID#2     | #CAMPAIGN_ID#A               | Penguin     | Memorial Day  |               |
+| TENANT_ID#2     | #CAMPAIGN_ID#B               | Penguin     | Flag Day      |               |
+| TENANT_ID#2     | #CAMPAIGN_ID#C               | Penguin     | My birthday   |               |
+| TENANT_ID#2     | #CUSTOMER_ID#1               | Penguin     |               | david         |
+| TENANT_ID#2     | #CAMPAIGN_ID#C#CUSTOMER_ID#1 | Penguin     | My birthday   | david         |
+
+** DynamoDB API Actions
+
+There are three ways by which you can operate on your data in a DynamoDB table:
+
+#+name: sample-campaigns
+| partition key | sort key    |             |               |
+|     tenant_id | campaign_id | tenant_name | campaign_name |
+|---------------+-------------+-------------+---------------|
+|             1 | A           | Smiles      | Christmas     |
+|             1 | B           | Smiles      | Thanksgiving  |
+|             2 | A           | Penguin     | Memorial Day  |
+|             2 | B           | Penguin     | Flag Day      |
+|             2 | C           | Penguin     | My birthday   |
+
+1. By a single item via the ~Item~ actions
+
+   #+begin_src go
+
+     req := &dynamodb.GetItemInput{
+             TableName:                aws.String("sample-campaigns"),
+             Key:                      toPrimaryKey(tenantID, campaignID) // partition key=1, sort key=A
+     }
+
+     rsp, err := dynamodb.GetItemWithContext(ctx, req)
+     if err != nil {
+             return nil, err
+     }
+
+     fmt.Printf("%+v", rsp.Item)
+     // {tenant_id: 1, campaign_id: A, tenant_name: Smiles, campaign_name: Christmas}
+
+   #+end_src
+   
+2. By multiple items via the ~Query~ action
+
+   #+begin_src go
+
+     keyCond := expression.Key("tenant_id").Equal(expression.Value("1"))
+     expr, err := expression.NewBuilder().WithKeyCondition(keyCond).Build()
+     if err != nil {
+             return nil, err
+     }
+
+     req := &dynamodb.QueryInput{
+             TableName:                 aws.String(x.TableName),
+             ExpressionAttributeNames:  expr.Names(),
+             ExpressionAttributeValues: expr.Values(),
+             KeyConditionExpression:    expr.KeyCondition(), // partition key=1
+     }
+
+     rsp, err := x.Config.QueryWithContext(ctx, input)
+     if err != nil {
+             return nil, err
+     }
+
+     fmt.Printf("%+v", rsp.Items)
+     // [
+     //   {tenant_id: 1, campaign_id: A, tenant_name: Smiles, campaign_name: Christmas},
+     //   {tenant_id: 1, campaign_id: B, tenant_name: Smiles, campaign_name: Thanksgiving}
+     // ]
+
+   #+end_src
+   
+3. By the entire table via the ~Scan~ action
+
+   - If you find yourself having to Scan a table quite often, you should probably reconsider the tables primary key.
+
+** Secondary Indexes
+
+A secondary index is a "sub-table" that has a different primary key than the one of the base table.
+
+The primary key in a secondary index does not have to be unique.
+
+- As you'd expect, unlike tables, secondary indexes do not support item level actions  
+
+|                  | Local Secondary Index (LSI) | Global Secondary Index (GSI) |
+|------------------+-----------------------------+------------------------------|
+| Partition Key    | Must match base table       | Can differ from base table   |
+| Sort Key         | Can differ from base table  | Can differ from base table   |
+| Read Consistency | Eventual + Strong           | Eventual                     |
+| Creation Time    | Same time as table          | Any time                     |
+
+** Consistency
+
+*** Quick Background
+
+DynamoDB replicates your data across a number of nodes.
+
+When writing to DynamoDB, all writes go to the primary node for a partition.
+
+DynamoDB then replicates the write operation to secondary nodes.
+    
+*** Eventual Consistency
+
+Eventually consistent reads read from a randomly selected node (either primary or secondary).
+
+This means there is a possibility that a read operation will select a secondary node that is yet to be synched with the primary node...
+
+...but the data is consistent across all nodes usually within 1 second*
+
+*https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html
+    
+*** Strong Consistency
+
+Strongly consistent reads read only from the primary node, so it will always return the latest data.
+
+2x the cost of eventually consistent reads.
+
+*In general, opt for eventually consistent reads, as they're half the cost of strongly consistent reads,*
+    
+*and consistency is achieved quickly enough that you most likely don't need to worry about it*
+
+
+* DynamoDB Streams
+
+   
+* More resources
+
+- re:Invent 2019: Data modeling with Amazon DynamoDB: https://youtu.be/DIQVJqiSUkE
+- re:Invent 2018: Amazon DynamoDB Deep Dive: Advanced Design Patterns for DynamoDB: https://youtu.be/HbaEPXoXVf2k
+- DynamoDB Book: https://www.dynamodbbook.com/
+- Dynamo Paper:  https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf
